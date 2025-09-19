@@ -7,11 +7,9 @@ import com.aetna.mainframe.entity.MainframeJobData;
 import com.aetna.mainframe.repository.MainframeRepository;
 import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
-import io.opentelemetry.api.logs.Logger;
 import org.apache.commons.lang3.StringUtils;
 import org.slf4j.LoggerFactory;
 import org.springframework.beans.factory.annotation.Autowired;
-import org.springframework.http.*;
 import org.springframework.stereotype.Service;
 import org.springframework.web.reactive.function.client.WebClient;
 import org.springframework.web.reactive.function.client.WebClientResponseException;
@@ -45,7 +43,6 @@ public class MainframeCustomAdaptorService {
     private static final org.slf4j.Logger logger =
             LoggerFactory.getLogger(MainframeCustomAdaptorService.class);
     
-    private final Logger otelLogger;
     private final WebClient webClient; // Using WebClient instead of RestTemplate
     private final MainframeConfig mainframeConfig;
     
@@ -68,11 +65,7 @@ public class MainframeCustomAdaptorService {
     final DateTimeFormatter formatterZone =
             DateTimeFormatter.ofPattern("yyyy-MM-dd H:mm z", Locale.ENGLISH);
 
-    public MainframeCustomAdaptorService(
-            Logger otelLogger,
-            MainframeConfig mainframeConfig
-    ) {
-        this.otelLogger = otelLogger;
+    public MainframeCustomAdaptorService(MainframeConfig mainframeConfig) {
         this.mainframeConfig = mainframeConfig;
         
         // Configure WebClient with proper timeout and error handling
@@ -101,65 +94,73 @@ public class MainframeCustomAdaptorService {
         }
     }
 
-    // Public entry - normal run
-    public void fetchAndLog() {
-        Mono<String> tokenMono = getAuthToken();
-        
-        tokenMono.subscribe(
-            token -> {
-                if (token == null) {
-                    logger.error("Token retrieval failed. Skipping fetchAndLog.");
-                    return;
-                }
-                
-                List<CompletableFuture<Void>> futures = mainframeConfig.getAppConfigs().stream()
-                        .map(config -> CompletableFuture.runAsync(() -> {
-                            String appName = config.getApplication();
-                            String combined = buildCombinedConfigString(config);
-                            logger.info("[{}] Starting data fetch for application", appName);
-                            fetchLogsAndSend(combined, token, appName);
-                        }, executorService))
-                        .collect(Collectors.toList());
-                
-                CompletableFuture.allOf(futures.toArray(new CompletableFuture[0])).join();
-                logger.info("Scheduled Normal Call Completed");
-            },
-            error -> handleError("Token retrieval for normal run", new RuntimeException(error))
-        );
+    // Public entry - normal run (reactive approach)
+    public Mono<Boolean> fetchAndLog() {
+        return getAuthToken()
+                .flatMap(token -> {
+                    if (token == null) {
+                        logger.error("Token retrieval failed. Skipping fetchAndLog.");
+                        return Mono.just(false);
+                    }
+
+                    List<Mono<Void>> monos = mainframeConfig.getAppConfigs().stream()
+                            .map(config -> {
+                                String appName = config.getApplication();
+                                String combined = buildCombinedConfigString(config);
+                                logger.info("[{}] Starting data fetch for application", appName);
+                                return fetchLogsAndSend(combined, token, appName);
+                            })
+                            .collect(Collectors.toList());
+
+                    return Mono.when(monos)
+                            .then(Mono.fromCallable(() -> {
+                                logger.info("Scheduled Normal Call Completed - All tasks finished successfully");
+                                return true;
+                            }));
+                })
+                .onErrorResume(e -> {
+                    logger.error("Error during scheduled normal fetch execution - {}", e.getMessage(), e);
+                    return Mono.just(false);
+                });
     }
 
-    // Public entry - history run
-    public void fetchAndLogHistory() {
-        Mono<String> tokenMono = getAuthToken();
-        
-        tokenMono.subscribe(
-            token -> {
-                if (token == null) {
-                    logger.error("Token retrieval failed. Skipping fetchAndLogHistory.");
-                    return;
-                }
-                
-                List<CompletableFuture<Void>> futures = mainframeConfig.getHistoryAppConfigs().stream()
-                        .map(config -> CompletableFuture.runAsync(() -> {
-                            String appName = config.getApplication();
-                            long startTime = System.currentTimeMillis();
-                            try {
+    // Public entry - history run (reactive approach)
+    public Mono<Boolean> fetchAndLogHistory() {
+        return getAuthToken()
+                .flatMap(token -> {
+                    if (token == null) {
+                        logger.error("Token retrieval failed. Skipping fetchAndLogHistory.");
+                        return Mono.just(false);
+                    }
+                    
+                    List<Mono<Void>> monos = mainframeConfig.getHistoryAppConfigs().stream()
+                            .map(config -> {
+                                String appName = config.getApplication();
+                                long startTime = System.currentTimeMillis();
                                 logger.info("[{}] Starting history data fetch for application", appName);
+                                
                                 String combined = buildCombinedConfigString(config);
-                                fetchLogsAndSend(combined, token, appName);
-                                long duration = System.currentTimeMillis() - startTime;
-                                logger.info("[{}] Processed history config in {} ms", appName, duration);
-                            } catch (Exception e) {
-                                handleError("Error processing history config: " + appName, e, appName);
-                            }
-                        }, executorService))
-                        .collect(Collectors.toList());
-                
-                CompletableFuture.allOf(futures.toArray(new CompletableFuture[0])).join();
-                logger.info("Scheduled History Call Completed");
-            },
-            error -> handleError("Token retrieval for history run", new RuntimeException(error))
-        );
+                                return fetchLogsAndSend(combined, token, appName)
+                                        .doOnSuccess(unused -> {
+                                            long duration = System.currentTimeMillis() - startTime;
+                                            logger.info("[{}] Processed history config in {} ms", appName, duration);
+                                        })
+                                        .doOnError(e -> {
+                                            logger.error("[{}] Error processing history config: {}", appName, e.getMessage(), e);
+                                        });
+                            })
+                            .collect(Collectors.toList());
+
+                    return Mono.when(monos)
+                            .then(Mono.fromCallable(() -> {
+                                logger.info("Scheduled History Call Completed - All history tasks finished successfully");
+                                return true;
+                            }));
+                })
+                .onErrorResume(e -> {
+                    logger.error("Error during scheduled history fetch execution - {}", e.getMessage(), e);
+                    return Mono.just(false);
+                });
     }
 
     // Build the combined string "appNameUrl~dataset~leapQuery" style from screenshots
@@ -203,7 +204,7 @@ public class MainframeCustomAdaptorService {
                 .onErrorReturn(null);
     }
 
-    // Error path logging + OTel log with application name
+    // Error path logging
     private void handleError(String source, Exception e) {
         handleError(source, e, null);
     }
@@ -212,19 +213,10 @@ public class MainframeCustomAdaptorService {
         String appPrefix = appName != null ? "[" + appName + "] " : "";
         String errorMessage = appPrefix + "Error in " + source + ": " + e.getMessage();
         logger.error(errorMessage, e);
-        
-        // Enhanced OpenTelemetry logging with application context
-        var logBuilder = otelLogger.logRecordBuilder().setBody(errorMessage);
-        if (appName != null) {
-            logBuilder.setAttribute("mainframe.application", appName);
-        }
-        logBuilder.setAttribute("error.type", e.getClass().getSimpleName())
-                  .setAttribute("error.source", source)
-                  .emit();
     }
 
     // Core fetch routine for one combined string using WebClient
-    private void fetchLogsAndSend(String appNameUrl, String token, String appName) {
+    private Mono<Void> fetchLogsAndSend(String appNameUrl, String token, String appName) {
         try {
             logger.info("[{}] Fetching URL {}", appName, mainframeConfig.getAuthUrl());
             String[] splitAppName = appNameUrl.split("~"); // [0]=appName, [1]=dataset, [2]=leapQuery
@@ -233,8 +225,7 @@ public class MainframeCustomAdaptorService {
 
             logger.info("[{}] Count url == {}", appName, countUrl);
             
-            // Get count using WebClient
-            Mono<String> countMono = webClient.get()
+            return webClient.get()
                     .uri(countUrl)
                     .headers(headers -> {
                         headers.setBearerAuth(token);
@@ -245,51 +236,49 @@ public class MainframeCustomAdaptorService {
                     })
                     .retrieve()
                     .bodyToMono(String.class)
-                    .doOnError(error -> handleError("Count API call", new RuntimeException(error), appName));
+                    .flatMap(responseBodyCount -> {
+                        logger.info("[{}] Count == {}", appName, responseBodyCount);
+                        
+                        if (responseBodyCount == null || responseBodyCount.trim().equalsIgnoreCase("0")) {
+                            logger.info("[{}] Count api returns 0", appName);
+                            return Mono.empty();
+                        }
 
-            countMono.subscribe(
-                responseBodyCount -> {
-                    logger.info("[{}] Count == {}", appName, responseBodyCount);
-                    
-                    if (responseBodyCount == null || responseBodyCount.trim().equalsIgnoreCase("0")) {
-                        logger.info("[{}] Count api returns 0", appName);
-                        return;
-                    }
+                        String leapUrl = mainframeConfig.getLeapUrl()
+                                + splitAppName[2].replace("{size}", responseBodyCount);
 
-                    String leapUrl = mainframeConfig.getLeapUrl()
-                            + splitAppName[2].replace("{size}", responseBodyCount);
-
-                    logger.info("[{}] Mainframe URL = {}", appName, leapUrl);
-                    
-                    // Get data using WebClient
-                    webClient.get()
-                            .uri(leapUrl)
-                            .headers(headers -> {
-                                headers.setBearerAuth(token);
-                                headers.add(HEADER_ACCEPT, mainframeConfig.getAccept());
-                                headers.add(HEADER_PROJECT, mainframeConfig.getProject());
-                                headers.add(HEADER_PROJECT_NAME, mainframeConfig.getProjectName());
-                                headers.add(HEADER_REFERER, mainframeConfig.getReferer());
-                            })
-                            .retrieve()
-                            .bodyToMono(String.class)
-                            .subscribe(
-                                responseBodyLeap -> {
-                                    processAndStoreLogs(responseBodyLeap, appName);
-                                    if (responseBodyLeap != null) {
-                                        double responseSizeMB =
-                                                responseBodyLeap.getBytes(StandardCharsets.UTF_8).length / (1024.0 * 1024.0);
-                                        logger.info("[{}] Response Size {} MB", appName, String.format("%.2f", responseSizeMB));
-                                    }
-                                },
-                                error -> handleError("Data API call", new RuntimeException(error), appName)
-                            );
-                },
-                error -> handleError("Count API processing", new RuntimeException(error), appName)
-            );
-            
+                        logger.info("[{}] Mainframe URL = {}", appName, leapUrl);
+                        
+                        return webClient.get()
+                                .uri(leapUrl)
+                                .headers(headers -> {
+                                    headers.setBearerAuth(token);
+                                    headers.add(HEADER_ACCEPT, mainframeConfig.getAccept());
+                                    headers.add(HEADER_PROJECT, mainframeConfig.getProject());
+                                    headers.add(HEADER_PROJECT_NAME, mainframeConfig.getProjectName());
+                                    headers.add(HEADER_REFERER, mainframeConfig.getReferer());
+                                })
+                                .retrieve()
+                                .bodyToMono(String.class)
+                                .flatMap(responseBodyLeap -> {
+                                    return Mono.fromRunnable(() -> {
+                                        processAndStoreLogs(responseBodyLeap, appName);
+                                        if (responseBodyLeap != null) {
+                                            double responseSizeMB =
+                                                    responseBodyLeap.getBytes(StandardCharsets.UTF_8).length / (1024.0 * 1024.0);
+                                            logger.info("[{}] Response Size {} MB", appName, String.format("%.2f", responseSizeMB));
+                                        }
+                                    });
+                                });
+                    })
+                    .onErrorResume(error -> {
+                        handleError("mainframe API Error", new RuntimeException(error), appName);
+                        return Mono.empty();
+                    });
+                
         } catch (Exception e) {
             handleError("mainframe API Error", e, appName);
+            return Mono.empty();
         }
     }
 
@@ -332,14 +321,6 @@ public class MainframeCustomAdaptorService {
             long duration = System.currentTimeMillis() - startTime;
             
             logger.info("[{}] Saved batch of {} entities in {} ms", appName, entities.size(), duration);
-            
-            // OpenTelemetry metrics for batch operations
-            otelLogger.logRecordBuilder()
-                    .setBody("Batch insert completed")
-                    .setAttribute("mainframe.application", appName)
-                    .setAttribute("batch.size", entities.size())
-                    .setAttribute("batch.duration_ms", duration)
-                    .emit();
                     
         } catch (Exception e) {
             handleError("Batch save operation", e, appName);
@@ -455,6 +436,7 @@ public class MainframeCustomAdaptorService {
         throw new DateTimeParseException("Unrecognized date format", value, 0);
     }
 }
+
 ```
 
 ## Additional Configuration Required
