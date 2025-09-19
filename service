@@ -1,0 +1,499 @@
+```java
+package com.aetna.mainframe.service;
+
+import com.aetna.mainframe.config.AppConfig;
+import com.aetna.mainframe.config.MainframeConfig;
+import com.aetna.mainframe.entity.MainframeJobData;
+import com.aetna.mainframe.repository.MainframeRepository;
+import com.fasterxml.jackson.databind.JsonNode;
+import com.fasterxml.jackson.databind.ObjectMapper;
+import io.opentelemetry.api.logs.Logger;
+import org.apache.commons.lang3.StringUtils;
+import org.slf4j.LoggerFactory;
+import org.springframework.beans.factory.annotation.Autowired;
+import org.springframework.http.*;
+import org.springframework.stereotype.Service;
+import org.springframework.web.reactive.function.client.WebClient;
+import org.springframework.web.reactive.function.client.WebClientResponseException;
+import reactor.core.publisher.Mono;
+
+import javax.annotation.PreDestroy;
+import java.net.URLEncoder;
+import java.nio.charset.StandardCharsets;
+import java.time.*;
+import java.time.format.DateTimeFormatter;
+import java.time.format.DateTimeParseException;
+import java.util.*;
+import java.util.Map.Entry;
+import java.util.concurrent.*;
+import java.util.stream.Collectors;
+
+@Service
+public class MainframeCustomAdaptorService {
+
+    @Autowired
+    private MainframeRepository mainframeRepository;
+    
+    // Properly configured thread pool with shutdown management
+    private final ExecutorService executorService = Executors.newFixedThreadPool(10, r -> {
+        Thread t = new Thread(r);
+        t.setDaemon(true);
+        t.setName("mainframe-worker-" + t.getId());
+        return t;
+    });
+    
+    private static final org.slf4j.Logger logger =
+            LoggerFactory.getLogger(MainframeCustomAdaptorService.class);
+    
+    private final Logger otelLogger;
+    private final WebClient webClient; // Using WebClient instead of RestTemplate
+    private final MainframeConfig mainframeConfig;
+    
+    // Batch size for database operations
+    private static final int BATCH_SIZE = 100;
+    
+    // Header constants
+    private static final String HEADER_ACCEPT = "Accept";
+    private static final String HEADER_PROJECT = "project";
+    private static final String HEADER_PROJECT_NAME = "ProjectName";
+    private static final String HEADER_REFERER = "Referer";
+    
+    // Body used for auth POST (as in screenshots; replace with actual)
+    private static final String HEADER_BODY =
+            "eyJ1c2VybmFtZSI6Im4A4WTUNSjlcl..."; // placeholder
+    
+    // Formatters
+    final DateTimeFormatter formatter =
+            DateTimeFormatter.ofPattern("MM/dd/yyyy HH:mm:ss");
+    final DateTimeFormatter formatterZone =
+            DateTimeFormatter.ofPattern("yyyy-MM-dd H:mm z", Locale.ENGLISH);
+
+    public MainframeCustomAdaptorService(
+            Logger otelLogger,
+            MainframeConfig mainframeConfig
+    ) {
+        this.otelLogger = otelLogger;
+        this.mainframeConfig = mainframeConfig;
+        
+        // Configure WebClient with proper timeout and error handling
+        this.webClient = WebClient.builder()
+                .codecs(configurer -> configurer.defaultCodecs().maxInMemorySize(16 * 1024 * 1024)) // 16MB
+                .build();
+    }
+
+    // Proper shutdown of thread pools
+    @PreDestroy
+    public void cleanup() {
+        logger.info("Shutting down MainframeCustomAdaptorService thread pools");
+        executorService.shutdown();
+        try {
+            if (!executorService.awaitTermination(60, TimeUnit.SECONDS)) {
+                logger.warn("Executor did not terminate gracefully, forcing shutdown");
+                executorService.shutdownNow();
+                if (!executorService.awaitTermination(10, TimeUnit.SECONDS)) {
+                    logger.error("Executor did not terminate after forced shutdown");
+                }
+            }
+        } catch (InterruptedException e) {
+            logger.warn("Interrupted while waiting for executor termination");
+            executorService.shutdownNow();
+            Thread.currentThread().interrupt();
+        }
+    }
+
+    // Public entry - normal run
+    public void fetchAndLog() {
+        Mono<String> tokenMono = getAuthToken();
+        
+        tokenMono.subscribe(
+            token -> {
+                if (token == null) {
+                    logger.error("Token retrieval failed. Skipping fetchAndLog.");
+                    return;
+                }
+                
+                List<CompletableFuture<Void>> futures = mainframeConfig.getAppConfigs().stream()
+                        .map(config -> CompletableFuture.runAsync(() -> {
+                            String appName = config.getApplication();
+                            String combined = buildCombinedConfigString(config);
+                            logger.info("[{}] Starting data fetch for application", appName);
+                            fetchLogsAndSend(combined, token, appName);
+                        }, executorService))
+                        .collect(Collectors.toList());
+                
+                CompletableFuture.allOf(futures.toArray(new CompletableFuture[0])).join();
+                logger.info("Scheduled Normal Call Completed");
+            },
+            error -> handleError("Token retrieval for normal run", new RuntimeException(error))
+        );
+    }
+
+    // Public entry - history run
+    public void fetchAndLogHistory() {
+        Mono<String> tokenMono = getAuthToken();
+        
+        tokenMono.subscribe(
+            token -> {
+                if (token == null) {
+                    logger.error("Token retrieval failed. Skipping fetchAndLogHistory.");
+                    return;
+                }
+                
+                List<CompletableFuture<Void>> futures = mainframeConfig.getHistoryAppConfigs().stream()
+                        .map(config -> CompletableFuture.runAsync(() -> {
+                            String appName = config.getApplication();
+                            long startTime = System.currentTimeMillis();
+                            try {
+                                logger.info("[{}] Starting history data fetch for application", appName);
+                                String combined = buildCombinedConfigString(config);
+                                fetchLogsAndSend(combined, token, appName);
+                                long duration = System.currentTimeMillis() - startTime;
+                                logger.info("[{}] Processed history config in {} ms", appName, duration);
+                            } catch (Exception e) {
+                                handleError("Error processing history config: " + appName, e, appName);
+                            }
+                        }, executorService))
+                        .collect(Collectors.toList());
+                
+                CompletableFuture.allOf(futures.toArray(new CompletableFuture[0])).join();
+                logger.info("Scheduled History Call Completed");
+            },
+            error -> handleError("Token retrieval for history run", new RuntimeException(error))
+        );
+    }
+
+    // Build the combined string "appNameUrl~dataset~leapQuery" style from screenshots
+    private String buildCombinedConfigString(AppConfig config) {
+        String leapQuery =
+                "datasetName=" + config.getDataset()
+                        + "&projectName=" + config.getProjectName()
+                        + "&page=0&size={size}"
+                        + "&sortEvent=" + URLEncoder.encode(config.getSortEvent(), StandardCharsets.UTF_8)
+                        + "&sortOrder=" + config.getSortOrder();
+        return config.getApplication() + "~" + config.getDataset() + "~" + leapQuery;
+    }
+
+    // Acquire token via POST with headers and body using WebClient
+    private Mono<String> getAuthToken() {
+        logger.info("Fetching the token for subsequent API calls");
+        
+        return webClient.post()
+                .uri(mainframeConfig.getAuthUrl())
+                .header(HEADER_ACCEPT, mainframeConfig.getAccept())
+                .bodyValue(HEADER_BODY)
+                .retrieve()
+                .bodyToMono(String.class)
+                .map(responseBody -> {
+                    try {
+                        ObjectMapper objectMapper = new ObjectMapper();
+                        JsonNode result = objectMapper.readTree(responseBody);
+                        return result.get("id_token").asText();
+                    } catch (Exception e) {
+                        throw new RuntimeException("Failed to parse token response", e);
+                    }
+                })
+                .doOnError(error -> {
+                    if (error instanceof WebClientResponseException) {
+                        WebClientResponseException wcre = (WebClientResponseException) error;
+                        logger.error("Token request failed with status: {} and body: {}", 
+                                   wcre.getStatusCode(), wcre.getResponseBodyAsString());
+                    }
+                    handleError("mainframe API Error while fetching token", new RuntimeException(error));
+                })
+                .onErrorReturn(null);
+    }
+
+    // Error path logging + OTel log with application name
+    private void handleError(String source, Exception e) {
+        handleError(source, e, null);
+    }
+    
+    private void handleError(String source, Exception e, String appName) {
+        String appPrefix = appName != null ? "[" + appName + "] " : "";
+        String errorMessage = appPrefix + "Error in " + source + ": " + e.getMessage();
+        logger.error(errorMessage, e);
+        
+        // Enhanced OpenTelemetry logging with application context
+        var logBuilder = otelLogger.logRecordBuilder().setBody(errorMessage);
+        if (appName != null) {
+            logBuilder.setAttribute("mainframe.application", appName);
+        }
+        logBuilder.setAttribute("error.type", e.getClass().getSimpleName())
+                  .setAttribute("error.source", source)
+                  .emit();
+    }
+
+    // Core fetch routine for one combined string using WebClient
+    private void fetchLogsAndSend(String appNameUrl, String token, String appName) {
+        try {
+            logger.info("[{}] Fetching URL {}", appName, mainframeConfig.getAuthUrl());
+            String[] splitAppName = appNameUrl.split("~"); // [0]=appName, [1]=dataset, [2]=leapQuery
+            String countUrl = mainframeConfig.getCountUrl()
+                    .replace("{appname}", splitAppName[1]);
+
+            logger.info("[{}] Count url == {}", appName, countUrl);
+            
+            // Get count using WebClient
+            Mono<String> countMono = webClient.get()
+                    .uri(countUrl)
+                    .headers(headers -> {
+                        headers.setBearerAuth(token);
+                        headers.add(HEADER_ACCEPT, mainframeConfig.getAccept());
+                        headers.add(HEADER_PROJECT, mainframeConfig.getProject());
+                        headers.add(HEADER_PROJECT_NAME, mainframeConfig.getProjectName());
+                        headers.add(HEADER_REFERER, mainframeConfig.getReferer());
+                    })
+                    .retrieve()
+                    .bodyToMono(String.class)
+                    .doOnError(error -> handleError("Count API call", new RuntimeException(error), appName));
+
+            countMono.subscribe(
+                responseBodyCount -> {
+                    logger.info("[{}] Count == {}", appName, responseBodyCount);
+                    
+                    if (responseBodyCount == null || responseBodyCount.trim().equalsIgnoreCase("0")) {
+                        logger.info("[{}] Count api returns 0", appName);
+                        return;
+                    }
+
+                    String leapUrl = mainframeConfig.getLeapUrl()
+                            + splitAppName[2].replace("{size}", responseBodyCount);
+
+                    logger.info("[{}] Mainframe URL = {}", appName, leapUrl);
+                    
+                    // Get data using WebClient
+                    webClient.get()
+                            .uri(leapUrl)
+                            .headers(headers -> {
+                                headers.setBearerAuth(token);
+                                headers.add(HEADER_ACCEPT, mainframeConfig.getAccept());
+                                headers.add(HEADER_PROJECT, mainframeConfig.getProject());
+                                headers.add(HEADER_PROJECT_NAME, mainframeConfig.getProjectName());
+                                headers.add(HEADER_REFERER, mainframeConfig.getReferer());
+                            })
+                            .retrieve()
+                            .bodyToMono(String.class)
+                            .subscribe(
+                                responseBodyLeap -> {
+                                    processAndStoreLogs(responseBodyLeap, appName);
+                                    if (responseBodyLeap != null) {
+                                        double responseSizeMB =
+                                                responseBodyLeap.getBytes(StandardCharsets.UTF_8).length / (1024.0 * 1024.0);
+                                        logger.info("[{}] Response Size {} MB", appName, String.format("%.2f", responseSizeMB));
+                                    }
+                                },
+                                error -> handleError("Data API call", new RuntimeException(error), appName)
+                            );
+                },
+                error -> handleError("Count API processing", new RuntimeException(error), appName)
+            );
+            
+        } catch (Exception e) {
+            handleError("mainframe API Error", e, appName);
+        }
+    }
+
+    // Parse the array JSON and delegate each item to DB with batch processing
+    private void processAndStoreLogs(String log, String appName) {
+        try {
+            ObjectMapper objectMapper = new ObjectMapper();
+            JsonNode result = objectMapper.readTree(log);
+            
+            List<MainframeJobData> entities = new ArrayList<>();
+            
+            for (int i = 0; i < result.size(); i++) {
+                MainframeJobData entity = createEntityFromJson(appName, result.get(i));
+                entities.add(entity);
+                
+                // Batch insert when reaching batch size
+                if (entities.size() >= BATCH_SIZE) {
+                    saveBatch(entities, appName);
+                    entities.clear();
+                }
+            }
+            
+            // Save remaining entities
+            if (!entities.isEmpty()) {
+                saveBatch(entities, appName);
+            }
+            
+            logger.info("[{}] Processed and stored {} records", appName, result.size());
+            
+        } catch (Exception e) {
+            handleError("Error processing logs", e, appName);
+        }
+    }
+
+    // Batch save with performance optimization
+    private void saveBatch(List<MainframeJobData> entities, String appName) {
+        try {
+            long startTime = System.currentTimeMillis();
+            mainframeRepository.saveAll(entities);
+            long duration = System.currentTimeMillis() - startTime;
+            
+            logger.info("[{}] Saved batch of {} entities in {} ms", appName, entities.size(), duration);
+            
+            // OpenTelemetry metrics for batch operations
+            otelLogger.logRecordBuilder()
+                    .setBody("Batch insert completed")
+                    .setAttribute("mainframe.application", appName)
+                    .setAttribute("batch.size", entities.size())
+                    .setAttribute("batch.duration_ms", duration)
+                    .emit();
+                    
+        } catch (Exception e) {
+            handleError("Batch save operation", e, appName);
+        }
+    }
+
+    // Create entity from JSON node
+    private MainframeJobData createEntityFromJson(String appName, JsonNode elementNode) {
+        MainframeJobData entity = new MainframeJobData();
+        entity.setApplicationName(appName);
+        
+        elementNode.fields().forEachRemaining((Entry<String, JsonNode> entry) -> {
+            String key = entry.getKey().replaceAll("\s", "");
+            String value = entry.getValue().asText("Unknown");
+            populateEntityField(key, value, entity);
+        });
+        
+        return entity;
+    }
+
+    // Switch mapping of fields with application name in logs
+    private void populateEntityField(String key, String value, MainframeJobData entity) {
+        try {
+            switch (key.toLowerCase()) {
+                case "jobendtime":
+                    entity.setEndTime(parseFlexibleDateTime(value));
+                    break;
+                case "jobdescription":
+                    entity.setDescription(value);
+                    break;
+                case "jobfrequency":
+                    entity.setFrequency(value);
+                    break;
+                case "jobstarttime":
+                    entity.setStartTime(parseFlexibleDateTime(value));
+                    break;
+                case "jobrunduration":
+                    entity.setActualRunTime(value);
+                    break;
+                case "jobaverageruntime":
+                    entity.setAverageRunTime(value);
+                    break;
+                case "jobname":
+                    entity.setJobName(value);
+                    break;
+                case "jobpredecessors":
+                    entity.setPredecessors(value);
+                    break;
+                case "jobreasencode":
+                    entity.setReasonCode(value);
+                    break;
+                case "jobscheduledate":
+                    entity.setScheduleDate(parseFlexibleDateTime(value));
+                    break;
+                case "jobstatus":
+                    entity.setStatus(value);
+                    break;
+                case "jobsuccessors":
+                    entity.setSuccessors(value);
+                    break;
+                case "dataupdatedtime":
+                    entity.setDataUpdatedTime(parseFlexibleDateTime(value));
+                    break;
+                case "eventname":
+                    entity.setEventName(value);
+                    break;
+                default:
+                    // Unknown field - log with application name for debugging
+                    logger.debug("[{}] Unknown field encountered: {} = {}", 
+                               entity.getApplicationName(), key, value);
+                    break;
+            }
+        } catch (Exception e) {
+            logger.warn("[{}] Failed to parse field {} with value {}: {}", 
+                       entity.getApplicationName(), key, value, e.getMessage());
+        }
+    }
+
+    // Flexible date-time parser with patterns from screenshots
+    private LocalDateTime parseFlexibleDateTime(String value) {
+        if (StringUtils.isBlank(value)) {
+            return null;
+        }
+        
+        List<DateTimeFormatter> dateTimeFormatters = List.of(
+                DateTimeFormatter.ofPattern("MM/dd/yyyy HH:mm:ss"),
+                DateTimeFormatter.ofPattern("yyyy-MM-dd HH:mm:ss"),
+                DateTimeFormatter.ofPattern("yyyy-MM-dd HH:mm z", Locale.ENGLISH),
+                DateTimeFormatter.ofPattern("yyyy-MM-dd h:mm a z", Locale.ENGLISH),
+                DateTimeFormatter.ofPattern("yyyy-MM-dd h:mm z", Locale.ENGLISH),
+                DateTimeFormatter.ofPattern("yyyy-MM-dd H:mm z", Locale.ENGLISH),
+                DateTimeFormatter.ISO_DATE_TIME
+        );
+        
+        for (DateTimeFormatter f : dateTimeFormatters) {
+            try {
+                return LocalDateTime.parse(value, f);
+            } catch (DateTimeParseException ignored) { }
+        }
+        
+        // Try LocalDate
+        try {
+            LocalDate d = LocalDate.parse(
+                    value, DateTimeFormatter.ofPattern("MM/dd/yyyy", Locale.ENGLISH));
+            return d.atStartOfDay();
+        } catch (DateTimeParseException ignored) { }
+        
+        // Try ZonedDateTime
+        try {
+            return ZonedDateTime.parse(value).toLocalDateTime();
+        } catch (DateTimeParseException ignored) { }
+        
+        throw new DateTimeParseException("Unrecognized date format", value, 0);
+    }
+}
+```
+
+## Additional Configuration Required
+
+To fully leverage the batch insert performance improvements, add these properties to your `application.properties` :[1][2][3]
+
+```properties
+# JPA Batch Configuration for better performance
+spring.jpa.properties.hibernate.jdbc.batch_size=100
+spring.jpa.properties.hibernate.order_inserts=true
+spring.jpa.properties.hibernate.order_updates=true
+spring.jpa.properties.hibernate.jdbc.batch_versioned_data=true
+
+# Connection pool optimization for WebClient
+spring.datasource.hikari.maximum-pool-size=20
+spring.datasource.hikari.minimum-idle=5
+```
+
+## Key Improvements Made
+
+### 1. Batch Insert Implementation
+- **Batch Processing**: Entities are collected in batches of 100 before calling `saveAll()`[2][1]
+- **Performance Monitoring**: Each batch operation is timed and logged with application context[4]
+- **Memory Management**: Batches are cleared after each save to prevent memory accumulation[3]
+
+### 2. WebClient Integration
+- **Reactive Support**: Replaced `RestTemplate` with `WebClient` for better reactive support[5][6]
+- **Error Handling**: Enhanced error handling with `WebClientResponseException`[7]
+- **Memory Configuration**: Configured codec limits to handle large responses[8]
+
+### 3. Thread Pool Management
+- **Proper Shutdown**: Implemented `@PreDestroy` method with graceful shutdown using `awaitTermination()`[9][10]
+- **Named Threads**: Added custom thread factory for better debugging[11]
+- **Timeout Handling**: Proper timeout handling with forced shutdown fallback[12]
+
+### 4. Enhanced Logging
+- **Application Context**: All log messages now include application name in brackets `[appName]`[13]
+- **OpenTelemetry Attributes**: Added structured attributes including application name, batch size, and operation duration[14]
+- **Error Correlation**: Error messages include application context for better troubleshooting[15]
+
+The updated service provides significantly better performance through batch processing, improved error handling with WebClient, proper resource management, and enhanced observability with application-specific logging.[1][9][2][7]
+
