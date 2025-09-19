@@ -94,7 +94,7 @@ public class MainframeCustomAdaptorService {
         }
     }
 
-    // Public entry - normal run (reactive approach)
+   // Public entry - normal run (alternative with Flux)
 public Mono<Boolean> fetchAndLog() {
     return getAuthToken()
             .flatMap(token -> {
@@ -103,17 +103,13 @@ public Mono<Boolean> fetchAndLog() {
                     return Mono.just(false);
                 }
 
-                // Convert to array of Publishers instead of List<Mono<Void>>
-                Mono<Void>[] monos = mainframeConfig.getAppConfigs().stream()
-                        .map(config -> {
+                return Flux.fromIterable(mainframeConfig.getAppConfigs())
+                        .flatMap(config -> {
                             String appName = config.getApplication();
                             String combined = buildCombinedConfigString(config);
                             logger.info("[{}] Starting data fetch for application", appName);
                             return fetchLogsAndSend(combined, token, appName);
                         })
-                        .toArray(Mono[]::new);
-
-                return Mono.when(monos)
                         .then(Mono.fromCallable(() -> {
                             logger.info("Scheduled Normal Call Completed - All tasks finished successfully");
                             return true;
@@ -125,7 +121,7 @@ public Mono<Boolean> fetchAndLog() {
             });
 }
 
-// Public entry - history run (reactive approach)
+// Public entry - history run (alternative with Flux)
 public Mono<Boolean> fetchAndLogHistory() {
     return getAuthToken()
             .flatMap(token -> {
@@ -134,9 +130,8 @@ public Mono<Boolean> fetchAndLogHistory() {
                     return Mono.just(false);
                 }
                 
-                // Convert to array of Publishers instead of List<Mono<Void>>
-                Mono<Void>[] monos = mainframeConfig.getHistoryAppConfigs().stream()
-                        .map(config -> {
+                return Flux.fromIterable(mainframeConfig.getHistoryAppConfigs())
+                        .flatMap(config -> {
                             String appName = config.getApplication();
                             long startTime = System.currentTimeMillis();
                             logger.info("[{}] Starting history data fetch for application", appName);
@@ -151,9 +146,6 @@ public Mono<Boolean> fetchAndLogHistory() {
                                         logger.error("[{}] Error processing history config: {}", appName, e.getMessage(), e);
                                     });
                         })
-                        .toArray(Mono[]::new);
-
-                return Mono.when(monos)
                         .then(Mono.fromCallable(() -> {
                             logger.info("Scheduled History Call Completed - All history tasks finished successfully");
                             return true;
@@ -164,6 +156,7 @@ public Mono<Boolean> fetchAndLogHistory() {
                 return Mono.just(false);
             });
 }
+
 
     // Build the combined string "appNameUrl~dataset~leapQuery" style from screenshots
     private String buildCombinedConfigString(AppConfig config) {
