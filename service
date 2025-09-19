@@ -487,6 +487,13 @@ spring.datasource.hikari.minimum-idle=5
 
 ### 3. Thread Pool Management
 - **Proper Shutdown**: Implemented `@PreDestroy` method with graceful shutdown using `awaitTermination()`[9][10]
+refactor: upgrade mainframe service to use WebClient and batch processing
+
+- Replace RestTemplate with reactive WebClient
+- Add batch database inserts for better performance
+- Implement proper thread pool shutdown with @PreDestroy
+- Enhance logging with application names for debugging
+
 - **Named Threads**: Added custom thread factory for better debugging[11]
 - **Timeout Handling**: Proper timeout handling with forced shutdown fallback[12]
 
